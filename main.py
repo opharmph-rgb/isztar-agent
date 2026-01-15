@@ -1,13 +1,11 @@
 from fastapi import FastAPI
 import requests
 import time
-from urllib.parse import urlparse, parse_qs
 
 app = FastAPI()
 
 BASE = "https://ext-isztar4.mf.gov.pl/tariff/rest/goods-nomenclature"
 
-# Cache w pamięci (na Render Free może się resetować po uśpieniu)
 CODES_CACHE = []
 CODES_CACHE_META = {
     "built": False,
@@ -19,83 +17,69 @@ CODES_CACHE_META = {
 }
 
 
-def _extract_last_page(json_data):
-    """Wyciąga numer ostatniej strony z links.last (JSON:API)."""
-    if not isinstance(json_data, dict):
-        return None
-    links = json_data.get("links") or {}
-    last_url = links.get("last")
-    if not last_url:
-        return None
-    try:
-        qs = parse_qs(urlparse(last_url).query)
-        page_vals = qs.get("page")
-        if page_vals:
-            return int(page_vals[0])
-    except Exception:
-        return None
-    return None
+def _walk_subgroup_tree(node, out):
+    """
+    Twoje /codes zwraca drzewo:
+      {description, subgroup:[...]} i czasem {code, description}
+    Przechodzimy rekurencyjnie i zbieramy wszystkie liście z code.
+    """
+    if isinstance(node, dict):
+        code = node.get("code")
+        desc = node.get("description")
+        if code and desc:
+            out.append({"code": str(code).strip(), "description": str(desc).strip()})
+
+        subgroup = node.get("subgroup")
+        if isinstance(subgroup, list):
+            for child in subgroup:
+                _walk_subgroup_tree(child, out)
+
+    elif isinstance(node, list):
+        for item in node:
+            _walk_subgroup_tree(item, out)
 
 
 def _parse_codes_response(json_data):
     """
-    ISZTAR /codes jest w JSON:API.
-    Najczęściej:
-      - json_data["data"] = lista rekordów
-      - rekord ma "attributes" z polami: code, description
-    Ten parser jest "odporny" na drobne różnice nazw pól.
+    Obsługujemy 2 możliwe formaty:
+    1) JSON:API (data/attributes) – na wszelki wypadek
+    2) DRZEWO (description/subgroup/code) – to co Ty pokazałeś
     """
-    if not isinstance(json_data, dict):
-        return []
-
-    rows = json_data.get("data") or []
-    if not isinstance(rows, list):
-        return []
-
     out = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
 
-        attrs = row.get("attributes") or {}
-        if not isinstance(attrs, dict):
-            attrs = {}
+    # (1) JSON:API (fallback)
+    if isinstance(json_data, dict) and isinstance(json_data.get("data"), list):
+        for row in json_data["data"]:
+            if not isinstance(row, dict):
+                continue
+            attrs = row.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            code = attrs.get("code") or attrs.get("goodsNomenclatureItemId") or row.get("id")
+            desc = attrs.get("description") or attrs.get("formattedDescription")
+            if code and desc:
+                out.append({"code": str(code).strip(), "description": str(desc).strip()})
+        return out
 
-        # możliwe nazwy kodu
-        code = (
-            attrs.get("code")
-            or attrs.get("goodsNomenclatureItemId")
-            or attrs.get("nomenclatureCode")
-            or row.get("id")
-        )
-
-        # możliwe nazwy opisu
-        desc = (
-            attrs.get("description")
-            or attrs.get("formattedDescription")
-            or attrs.get("descriptionFormatted")
-            or attrs.get("description_formatted")
-        )
-
-        if code and desc:
-            out.append({"code": str(code).strip(), "description": str(desc).strip()})
-
+    # (2) Drzewo subgroup (TO U CIEBIE)
+    _walk_subgroup_tree(json_data, out)
     return out
 
 
-def build_codes_cache(date="2025-11-17", language="PL", max_pages=5000, time_budget_seconds=25):
+def build_codes_cache(date="2025-11-17", language="PL", max_pages=200, time_budget_seconds=40):
     """
-    Pobiera kolejne strony /codes i buduje cache.
-    Zabezpieczenia:
-      - max_pages (twardy limit)
-      - time_budget_seconds (żeby nie wisiało)
+    Pobiera kolejne strony /codes?page=1..N i buduje cache.
+    Kończymy, gdy:
+    - przekroczymy limit czasu
+    - dostaniemy 404/422
+    - albo parser nie znalazł NIC na danej stronie
     """
     global CODES_CACHE, CODES_CACHE_META
 
     start = time.time()
-    page = 1
-    last_page = None
     items = []
+    page = 1
+    last_ok_page = 0
 
     while page <= max_pages:
         if (time.time() - start) > time_budget_seconds:
@@ -106,32 +90,28 @@ def build_codes_cache(date="2025-11-17", language="PL", max_pages=5000, time_bud
             params={"date": date, "language": language, "page": page},
             timeout=30,
         )
+
+        # jeśli API mówi "nie ma tej strony" – kończymy
+        if r.status_code in (404, 422):
+            break
+
         r.raise_for_status()
         data = r.json()
 
-        if last_page is None:
-            lp = _extract_last_page(data)
-            if lp:
-                last_page = lp
-
         page_items = _parse_codes_response(data)
 
-        # jeśli nagle nic nie przyszło, kończymy (albo struktura, albo koniec)
+        # jeśli nic nie znaleźliśmy na stronie -> kończymy
         if not page_items:
-            # ale nie kończ na stronie 1 bez diagnostyki — zostaw meta i przerwij
             break
 
         items.extend(page_items)
-
-        if last_page and page >= last_page:
-            break
-
+        last_ok_page = page
         page += 1
 
     # deduplikacja po code
     uniq = {}
     for it in items:
-        if it["code"]:
+        if it.get("code"):
             uniq[it["code"]] = it
 
     CODES_CACHE = list(uniq.values())
@@ -139,7 +119,7 @@ def build_codes_cache(date="2025-11-17", language="PL", max_pages=5000, time_bud
     CODES_CACHE_META["built"] = True
     CODES_CACHE_META["count"] = len(CODES_CACHE)
     CODES_CACHE_META["last_build_seconds"] = round(time.time() - start, 2)
-    CODES_CACHE_META["last_page"] = last_page if last_page else page
+    CODES_CACHE_META["last_page"] = last_ok_page if last_ok_page else None
     CODES_CACHE_META["date"] = date
     CODES_CACHE_META["language"] = language
 
@@ -162,7 +142,6 @@ def rebuild_index(date: str = "2025-11-17", language: str = "PL"):
 
 @app.get("/debug_codes_page")
 def debug_codes_page(date: str = "2025-11-17", language: str = "PL", page: int = 1):
-    """Podgląd surowej odpowiedzi ISZTAR /codes dla jednej strony."""
     r = requests.get(
         f"{BASE}/codes",
         params={"date": date, "language": language, "page": page},
@@ -184,17 +163,13 @@ def measures(code: str, date: str = "2025-11-17", language: str = "PL"):
 
 
 @app.get("/search_codes")
-def search_codes(
-    q: str,
-    date: str = "2025-11-17",
-    language: str = "PL",
-    limit: int = 30,
-):
-    """
-    Szuka po opisie w lokalnym cache.
-    Jeśli cache nie jest zbudowany — buduje go przy pierwszym wywołaniu.
-    """
-    if not CODES_CACHE_META["built"] or CODES_CACHE_META.get("date") != date or CODES_CACHE_META.get("language") != language:
+def search_codes(q: str, date: str = "2025-11-17", language: str = "PL", limit: int = 30):
+    # auto-build, jeśli brak indeksu lub inna data/język
+    if (
+        not CODES_CACHE_META["built"]
+        or CODES_CACHE_META.get("date") != date
+        or CODES_CACHE_META.get("language") != language
+    ):
         build_codes_cache(date=date, language=language)
 
     q_low = q.lower().strip()
