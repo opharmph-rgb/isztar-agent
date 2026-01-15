@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException
 import requests
 import time
-import os
 
 app = FastAPI()
 
 BASE = "https://ext-isztar4.mf.gov.pl/tariff/rest/goods-nomenclature"
 
-# cache w pamięci
 CODES_CACHE = []
 CODES_CACHE_META = {
     "built": False,
@@ -20,43 +18,59 @@ CODES_CACHE_META = {
 }
 
 
-def _walk_subgroup_tree(node, out):
-    """Rekurencyjnie zbiera wszystkie liście z code/description w strukturze subgroup."""
+def _normalize_text(s: str) -> str:
+    # proste czyszczenie: myślniki/duże spacje
+    s = (s or "").strip()
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s
+
+
+def _walk_tree_with_context(node, out, context):
+    """
+    Rekurencyjnie idziemy po drzewie subgroup.
+    context = lista opisów rodziców (nagłówków).
+    Gdy trafimy na liść z code, to do jego opisu dopisujemy kontekst.
+    """
     if isinstance(node, dict):
-        code = node.get("code")
         desc = node.get("description")
-        if code and desc:
-            out.append({"code": str(code).strip(), "description": str(desc).strip()})
+        desc_norm = _normalize_text(desc) if isinstance(desc, str) else None
+
+        # aktualizujemy kontekst, ale tylko jeśli jest sensowny opis
+        new_context = context
+        if desc_norm:
+            new_context = context + [desc_norm]
+
+        code = node.get("code")
+        if code and desc_norm:
+            # zbuduj opis z kontekstem (unikalne, bez powtórzeń)
+            # np. "ZWIERZĘTA ŻYWE > Konie... > - Konie > - - Pozostałe"
+            full_desc = " > ".join(new_context)
+            out.append({"code": str(code).strip(), "description": full_desc})
 
         subgroup = node.get("subgroup")
         if isinstance(subgroup, list):
             for child in subgroup:
-                _walk_subgroup_tree(child, out)
+                _walk_tree_with_context(child, out, new_context)
 
     elif isinstance(node, list):
         for item in node:
-            _walk_subgroup_tree(item, out)
+            _walk_tree_with_context(item, out, context)
 
 
 def _parse_codes_tree(json_data):
     out = []
-    _walk_subgroup_tree(json_data, out)
+    _walk_tree_with_context(json_data, out, context=[])
     return out
 
 
 def build_codes_cache(date="2025-11-17", language="PL", pages=3, time_budget_seconds=25):
-    """
-    Bezpieczna budowa indeksu:
-    - domyślnie tylko kilka stron (pages=3)
-    - limit czasu
-    """
     global CODES_CACHE, CODES_CACHE_META
 
     start = time.time()
     items = []
     last_ok_page = 0
 
-    # reset meta (ale nie wywalaj cache jeśli budowa padnie)
     CODES_CACHE_META.update({
         "built": False,
         "count": 0,
@@ -78,7 +92,6 @@ def build_codes_cache(date="2025-11-17", language="PL", pages=3, time_budget_sec
                 timeout=30,
             )
 
-            # jak nie ma strony lub walidacja padła, kończymy
             if r.status_code in (404, 422):
                 break
 
@@ -87,13 +100,12 @@ def build_codes_cache(date="2025-11-17", language="PL", pages=3, time_budget_sec
 
             page_items = _parse_codes_tree(data)
             if not page_items:
-                # jeśli na tej stronie nic nie było, kończymy
                 break
 
             items.extend(page_items)
             last_ok_page = page
 
-        # deduplikacja po code
+        # deduplikacja
         uniq = {}
         for it in items:
             c = it.get("code")
@@ -107,7 +119,6 @@ def build_codes_cache(date="2025-11-17", language="PL", pages=3, time_budget_sec
         CODES_CACHE_META["last_page"] = last_ok_page if last_ok_page else None
 
     except Exception as e:
-        # zostaw czytelną informację o błędzie
         CODES_CACHE_META["last_error"] = repr(e)
         raise
 
@@ -124,15 +135,10 @@ def index_status():
 
 @app.get("/rebuild_index")
 def rebuild_index(date: str = "2025-11-17", language: str = "PL", pages: int = 3):
-    """
-    Najpierw zbuduj mały indeks (pages=3).
-    Potem możesz zwiększać pages (np. 10, 30, 100).
-    """
     try:
         build_codes_cache(date=date, language=language, pages=pages)
         return {"ok": True, "meta": CODES_CACHE_META}
     except Exception as e:
-        # zwróć błąd w JSON, zamiast „Internal Server Error” bez info
         raise HTTPException(status_code=500, detail={"error": repr(e), "meta": CODES_CACHE_META})
 
 
@@ -160,7 +166,6 @@ def measures(code: str, date: str = "2025-11-17", language: str = "PL"):
 
 @app.get("/search_codes")
 def search_codes(q: str, date: str = "2025-11-17", language: str = "PL", limit: int = 30):
-    # jeśli brak indeksu, buduj malutki (pages=3), żeby nie zabijać serwera
     if (
         not CODES_CACHE_META["built"]
         or CODES_CACHE_META.get("date") != date
@@ -169,7 +174,6 @@ def search_codes(q: str, date: str = "2025-11-17", language: str = "PL", limit: 
         try:
             build_codes_cache(date=date, language=language, pages=3)
         except Exception:
-            # jak budowa padła, i tak pokaż meta z last_error
             pass
 
     q_low = q.lower().strip()
