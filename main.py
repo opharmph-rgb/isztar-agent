@@ -7,16 +7,20 @@ app = FastAPI()
 
 BASE = "https://ext-isztar4.mf.gov.pl/tariff/rest/goods-nomenclature"
 
-# --- Prosty cache w pamięci (na Free Render może się resetować po uśpieniu) ---
+# Cache w pamięci (na Render Free może się resetować po uśpieniu)
 CODES_CACHE = []
-CODES_CACHE_META = {"built": False, "count": 0, "last_build_seconds": None, "last_page": None}
+CODES_CACHE_META = {
+    "built": False,
+    "count": 0,
+    "last_build_seconds": None,
+    "last_page": None,
+    "date": None,
+    "language": None,
+}
 
 
 def _extract_last_page(json_data):
-    """
-    ISZTAR4 zwraca JSON:API z 'links'. W linku 'last' często jest page=...
-    Jeśli nie znajdziemy, zwracamy None.
-    """
+    """Wyciąga numer ostatniej strony z links.last (JSON:API)."""
     if not isinstance(json_data, dict):
         return None
     links = json_data.get("links") or {}
@@ -33,12 +37,58 @@ def _extract_last_page(json_data):
     return None
 
 
+def _parse_codes_response(json_data):
+    """
+    ISZTAR /codes jest w JSON:API.
+    Najczęściej:
+      - json_data["data"] = lista rekordów
+      - rekord ma "attributes" z polami: code, description
+    Ten parser jest "odporny" na drobne różnice nazw pól.
+    """
+    if not isinstance(json_data, dict):
+        return []
+
+    rows = json_data.get("data") or []
+    if not isinstance(rows, list):
+        return []
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        attrs = row.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        # możliwe nazwy kodu
+        code = (
+            attrs.get("code")
+            or attrs.get("goodsNomenclatureItemId")
+            or attrs.get("nomenclatureCode")
+            or row.get("id")
+        )
+
+        # możliwe nazwy opisu
+        desc = (
+            attrs.get("description")
+            or attrs.get("formattedDescription")
+            or attrs.get("descriptionFormatted")
+            or attrs.get("description_formatted")
+        )
+
+        if code and desc:
+            out.append({"code": str(code).strip(), "description": str(desc).strip()})
+
+    return out
+
+
 def build_codes_cache(date="2025-11-17", language="PL", max_pages=5000, time_budget_seconds=25):
     """
-    Pobiera wszystkie strony /codes i buduje cache.
+    Pobiera kolejne strony /codes i buduje cache.
     Zabezpieczenia:
-    - limit max_pages
-    - limit czasu time_budget_seconds (żeby nie wisiało)
+      - max_pages (twardy limit)
+      - time_budget_seconds (żeby nie wisiało)
     """
     global CODES_CACHE, CODES_CACHE_META
 
@@ -48,47 +98,50 @@ def build_codes_cache(date="2025-11-17", language="PL", max_pages=5000, time_bud
     items = []
 
     while page <= max_pages:
-        # przerwij jeśli przekroczysz budżet czasu
         if (time.time() - start) > time_budget_seconds:
             break
 
-        r = requests.get(f"{BASE}/codes", params={"date": date, "language": language, "page": page}, timeout=30)
+        r = requests.get(
+            f"{BASE}/codes",
+            params={"date": date, "language": language, "page": page},
+            timeout=30,
+        )
         r.raise_for_status()
         data = r.json()
 
-        # ustal last_page, jeśli API podaje link "last"
         if last_page is None:
             lp = _extract_last_page(data)
             if lp:
                 last_page = lp
 
-        rows = data if isinstance(data, list) else data.get("results", [])
-        if not rows:
-            # koniec listy
+        page_items = _parse_codes_response(data)
+
+        # jeśli nagle nic nie przyszło, kończymy (albo struktura, albo koniec)
+        if not page_items:
+            # ale nie kończ na stronie 1 bez diagnostyki — zostaw meta i przerwij
             break
 
-        for row in rows:
-            code = str(row.get("code", "")).strip()
-            desc = str(row.get("description", "")).strip()
-            if code and desc:
-                items.append({"code": code, "description": desc})
+        items.extend(page_items)
 
-        # jeśli znamy last_page i ją osiągnęliśmy
         if last_page and page >= last_page:
             break
 
         page += 1
 
-    # deduplikacja
+    # deduplikacja po code
     uniq = {}
     for it in items:
-        uniq[it["code"]] = it
+        if it["code"]:
+            uniq[it["code"]] = it
 
     CODES_CACHE = list(uniq.values())
+
     CODES_CACHE_META["built"] = True
     CODES_CACHE_META["count"] = len(CODES_CACHE)
     CODES_CACHE_META["last_build_seconds"] = round(time.time() - start, 2)
     CODES_CACHE_META["last_page"] = last_page if last_page else page
+    CODES_CACHE_META["date"] = date
+    CODES_CACHE_META["language"] = language
 
 
 @app.get("/")
@@ -103,30 +156,45 @@ def index_status():
 
 @app.get("/rebuild_index")
 def rebuild_index(date: str = "2025-11-17", language: str = "PL"):
-    # ręczne przebudowanie cache
     build_codes_cache(date=date, language=language)
     return {"ok": True, "meta": CODES_CACHE_META}
 
 
+@app.get("/debug_codes_page")
+def debug_codes_page(date: str = "2025-11-17", language: str = "PL", page: int = 1):
+    """Podgląd surowej odpowiedzi ISZTAR /codes dla jednej strony."""
+    r = requests.get(
+        f"{BASE}/codes",
+        params={"date": date, "language": language, "page": page},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 @app.get("/measures")
 def measures(code: str, date: str = "2025-11-17", language: str = "PL"):
-    url = f"{BASE}/measures"
     r = requests.get(
-        url,
+        f"{BASE}/measures",
         params={"nomenclatureCode": code, "date": date, "language": language},
-        timeout=30
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()
 
 
 @app.get("/search_codes")
-def search_codes(q: str, date: str = "2025-11-17", language: str = "PL", limit: int = 30):
+def search_codes(
+    q: str,
+    date: str = "2025-11-17",
+    language: str = "PL",
+    limit: int = 30,
+):
     """
     Szuka po opisie w lokalnym cache.
     Jeśli cache nie jest zbudowany — buduje go przy pierwszym wywołaniu.
     """
-    if not CODES_CACHE_META["built"]:
+    if not CODES_CACHE_META["built"] or CODES_CACHE_META.get("date") != date or CODES_CACHE_META.get("language") != language:
         build_codes_cache(date=date, language=language)
 
     q_low = q.lower().strip()
@@ -137,4 +205,9 @@ def search_codes(q: str, date: str = "2025-11-17", language: str = "PL", limit: 
             if len(hits) >= max(1, limit):
                 break
 
-    return {"query": q, "count": len(hits), "items": hits, "index_meta": CODES_CACHE_META}
+    return {
+        "query": q,
+        "count": len(hits),
+        "items": hits,
+        "index_meta": CODES_CACHE_META,
+    }
